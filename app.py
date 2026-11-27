@@ -25,7 +25,6 @@ def resource_path(*parts):
     return root.joinpath(*parts)
 
 def configure_bundled_tesseract():
-    # The GitHub Actions build bundles Tesseract and Russian traineddata inside the EXE.
     tess_dir = resource_path("tesseract")
     exe = tess_dir / "tesseract.exe"
     data_dir = tess_dir / "tessdata"
@@ -37,6 +36,13 @@ def configure_bundled_tesseract():
 def normalize(s: str) -> str:
     s = s.casefold().replace("ё", "е")
     return s.translate(str.maketrans({"ѣ": "е", "і": "и", "ѳ": "ф", "ѵ": "и"}))
+
+def is_line_hyphenated(text: str) -> bool:
+    # Hyphen-like marks that OCR commonly recognizes at a line ending.
+    return bool(text) and text.rstrip().endswith(("-", "‐", "‑", "‒", "–", "—", "="))
+
+def strip_line_hyphen(text: str) -> str:
+    return text.rstrip().rstrip("-‐‑‒–—=").rstrip()
 
 class OCRWorker(QThread):
     progress = Signal(int, int)
@@ -52,7 +58,9 @@ class OCRWorker(QThread):
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             stat = Path(self.pdf_path).stat()
-            digest = hashlib.sha256((self.pdf_path + str(stat.st_mtime_ns) + str(stat.st_size)).encode("utf-8")).hexdigest()[:20]
+            digest = hashlib.sha256(
+                (self.pdf_path + str(stat.st_mtime_ns) + str(stat.st_size) + "_hyphen_v2").encode("utf-8")
+            ).hexdigest()[:20]
             cache_file = CACHE_DIR / f"{digest}.json"
             if cache_file.exists():
                 try:
@@ -89,15 +97,51 @@ class OCRWorker(QThread):
                         "top": int(data["top"][i]),
                         "width": int(data["width"][i]),
                         "height": int(data["height"][i]),
-                        "conf": conf
+                        "conf": conf,
+                        "block_num": int(data["block_num"][i]),
+                        "par_num": int(data["par_num"][i]),
+                        "line_num": int(data["line_num"][i]),
                     })
                 pages.append({"page": page_no, "width": pix.width, "height": pix.height, "words": words})
                 self.progress.emit(page_no + 1, total)
             doc.close()
-            cache_file.write_text(json.dumps({"pdf_path": self.pdf_path, "pages": pages}, ensure_ascii=False), encoding="utf-8")
+            cache_file.write_text(
+                json.dumps({"pdf_path": self.pdf_path, "pages": pages}, ensure_ascii=False),
+                encoding="utf-8"
+            )
             self.finished_ok.emit(str(cache_file), total)
         except Exception as e:
             self.failed.emit(str(e))
+
+def make_logical_words(words):
+    """
+    Merge OCR tokens split by a printed line-end hyphen:
+      'Шаба-' + next-line 'линскаго' -> 'Шабалинскаго'.
+    Both original word boxes are retained for visual highlighting.
+    """
+    logical = []
+    i = 0
+    while i < len(words):
+        first = words[i]
+        if is_line_hyphenated(first["text"]) and i + 1 < len(words):
+            second = words[i + 1]
+            same_ocr_line = (
+                first.get("block_num") == second.get("block_num")
+                and first.get("par_num") == second.get("par_num")
+                and first.get("line_num") == second.get("line_num")
+            )
+            if not same_ocr_line:
+                joined = strip_line_hyphen(first["text"]) + second["text"].lstrip()
+                logical.append({
+                    "text": joined,
+                    "boxes": [first, second],
+                    "conf": min(first.get("conf", 0), second.get("conf", 0))
+                })
+                i += 2
+                continue
+        logical.append({"text": first["text"], "boxes": [first], "conf": first.get("conf", 0)})
+        i += 1
+    return logical
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -175,7 +219,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([360, 800])
         layout.addWidget(splitter, 1)
 
-        note = QLabel("Для старинной печати OCR может ошибаться. Если совпадение не найдено, попробуйте часть слова или другой вариант написания.")
+        note = QLabel("Переносы слов через дефис на конце строки учитываются: например, «Шаба-» + «линскаго» ищется как «Шабалинскаго». Для старинной печати OCR всё ещё может ошибаться.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #666;")
         layout.addWidget(note)
@@ -198,11 +242,10 @@ class MainWindow(QMainWindow):
         if not self.pdf_path:
             return
         try:
-            langs = pytesseract.get_languages(config="")
-            if "rus" not in langs:
-                raise RuntimeError("В автономную сборку не включён русский языковой пакет rus.")
+            if "rus" not in pytesseract.get_languages(config=""):
+                raise RuntimeError("Не найден встроенный русский языковой пакет rus.")
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка OCR", f"Не удалось запустить встроенное распознавание текста.\n\n{e}")
+            QMessageBox.critical(self, "Ошибка OCR", f"Не удалось запустить распознавание текста.\n\n{e}")
             return
         self.ocr_btn.setEnabled(False)
         self.open_btn.setEnabled(False)
@@ -244,14 +287,18 @@ class MainWindow(QMainWindow):
         if not query:
             QMessageBox.information(self, "Поиск", "Введите слово или часть слова.")
             return
+
         self.results.clear()
         self.matches = []
         for page in self.index_data["pages"]:
-            for word in page["words"]:
-                if query in normalize(word["text"]):
-                    self.matches.append((page, word))
-        for page, word in self.matches:
-            self.results.addItem(QListWidgetItem(f"Стр. {page['page'] + 1}: {word['text']}  (OCR: {word['conf']:.0f}%)"))
+            for logical_word in make_logical_words(page["words"]):
+                if query in normalize(logical_word["text"]):
+                    self.matches.append((page, logical_word))
+
+        for page, logical_word in self.matches:
+            self.results.addItem(QListWidgetItem(
+                f"Стр. {page['page'] + 1}: {logical_word['text']}  (OCR: {logical_word['conf']:.0f}%)"
+            ))
         self.result_count.setText(f"Совпадений: {len(self.matches)}")
         if self.matches:
             self.results.setCurrentRow(0)
@@ -261,7 +308,7 @@ class MainWindow(QMainWindow):
     def show_result(self, row):
         if row < 0 or row >= len(self.matches):
             return
-        page_data, word = self.matches[row]
+        page_data, logical_word = self.matches[row]
         doc = fitz.open(self.pdf_path)
         page = doc.load_page(page_data["page"])
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -269,7 +316,8 @@ class MainWindow(QMainWindow):
         qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
         painter = QPainter(qimg)
         painter.setPen(QPen(QColor(255, 35, 35), 5))
-        painter.drawRect(word["left"], word["top"], word["width"], word["height"])
+        for box in logical_word["boxes"]:
+            painter.drawRect(box["left"], box["top"], box["width"], box["height"])
         painter.end()
         pm = QPixmap.fromImage(qimg)
         max_width = max(600, self.scroll.viewport().width() - 30)
@@ -277,7 +325,7 @@ class MainWindow(QMainWindow):
             pm = pm.scaledToWidth(max_width, Qt.SmoothTransformation)
         self.image_label.setPixmap(pm)
         self.image_label.resize(pm.size())
-        self.preview_title.setText(f"Страница {page_data['page'] + 1} — найдено: «{word['text']}»")
+        self.preview_title.setText(f"Страница {page_data['page'] + 1} — найдено: «{logical_word['text']}»")
 
 def main():
     configure_bundled_tesseract()
