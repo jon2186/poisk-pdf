@@ -1,0 +1,57 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tesseract OCR (Russian)
+        shell: pwsh
+        run: |
+          choco install tesseract --yes --no-progress
+          $tess = "C:\Program Files\Tesseract-OCR"
+          if (!(Test-Path "$tess\tesseract.exe")) {
+            throw "Tesseract was not installed at the expected path."
+          }
+          if (!(Test-Path "$tess\tessdata\rus.traineddata")) {
+            throw "Russian OCR language file rus.traineddata was not found."
+          }
+          New-Item -ItemType Directory -Force -Path "bundle\tesseract" | Out-Null
+          Copy-Item "$tess\*" "bundle\tesseract" -Recurse -Force
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build one-file executable
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name "Поиск_по_PDF" `
+            --add-data "bundle\tesseract;tesseract" `
+            --collect-all PySide6 `
+            --collect-all fitz `
+            app.py
+          if (!(Test-Path "dist\Поиск_по_PDF.exe")) {
+            throw "EXE build failed."
+          }
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: Poisk-po-PDF-Windows10-x64
+          path: dist/Поиск_по_PDF.exe
+          retention-days: 30
